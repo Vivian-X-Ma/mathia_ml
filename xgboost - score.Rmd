@@ -1,0 +1,276 @@
+---
+title: "Untitled"
+author: "Siqi"
+date: "2025-06-22"
+output: html_document
+---
+
+
+```{r}
+library(skimr)
+library(tidyverse)
+library(tidymodels)
+library(janitor)
+library(xgboost)
+library(vip)
+library(rpart)
+library(rpart.plot)
+library(themis)
+```
+
+
+```{r}
+score <- read_csv('C:/Users/ASUS/Desktop/MATHia/student_scores_train.csv')
+action <- read_csv('C:/Users/ASUS/Desktop/MATHia/workspace_summary_train.csv')
+
+#glimpse(score)
+```
+
+
+```{r}
+skim(score$PostMath)
+skim(action)
+str(action)
+
+# histogram
+hist(score$PostMath, probability = TRUE,
+     main = "Histogram with Density",
+     xlab = "PostMath Score",
+     col = "lightgreen", border = "white")
+lines(density(score$PostMath, na.rm = TRUE), col = "red", lwd = 2)
+
+```
+
+
+```{r}
+ou <- action %>%
+  group_by(Anon.Student.Id) %>%
+  summarise(
+    num_workspaces_completed = n_distinct(workspace),
+    avg_time_per_workspace = mean(workspace_total_time_seconds),
+    graduation_rate = sum(workspace_progress_status == "GRADUATED")/num_workspaces_completed,
+    avg_step_problems_completed = sum(step_by_step_problems_completed) / num_workspaces_completed,
+    avg_problem_completion_ratio = mean(problems_completed / max_problem_count),
+    avg_hint_count = mean(hint_count),
+    avg_error_count = mean(error_count),
+    
+    avg_skill_mastery_ratio = mean(
+      if_else(skills_encountered > 0,
+              skills_mastered / skills_encountered,
+              0),
+      na.rm = TRUE
+    ),
+
+    aplse_score_ratio = mean (aplse_earned / aplse_possible)
+  )
+```
+
+
+```{r}
+ou <- ou %>%
+  left_join(score %>% select(Anon.Student.Id, PreMath, PostMath), by = "Anon.Student.Id")
+```
+
+# delete NA postMath
+
+```{r}
+ou <- ou %>% filter(!is.na(PostMath))
+```
+
+
+
+# -----------------------------------
+```{r}
+ou_split<-initial_split(ou)
+
+ou_train<-training(ou_split)
+
+ou_test<-testing(ou_split)
+```
+
+
+# baseline model
+```{r}
+mean(ou_train$PostMath, na.rm = TRUE)
+```
+
+
+
+## Formula and Recipe, same as last time
+
+```{r}
+rf_formula<-as.formula("PostMath ~.")
+```
+
+
+```{r}
+ou_rec <- recipe(rf_formula, data = ou_train) %>%
+  update_role(Anon.Student.Id, new_role = "ID") %>%
+  update_role(PostMath, new_role = "outcome") %>%
+  
+  step_nzv(all_predictors()) %>%
+
+  step_impute_knn(all_numeric_predictors()) %>%
+  
+  step_corr(all_numeric_predictors(), threshold = 0.95)
+
+```
+
+
+# look at the transformed data 
+```{r eval=FALSE, include=FALSE}
+ou_prep <- prep(ou_rec)
+
+ou_prep
+
+bake(ou_prep, new_data = NULL) %>% str()
+```
+
+
+## XGboost Specification
+
+From: https://juliasilge.com/blog/xgboost-tune-volleyball/
+
+
+```{r}
+xgb_spec <- boost_tree(
+  trees = 500,  # 1000
+  tree_depth = tune(), 
+  min_n = tune(),
+  loss_reduction = tune(), ## first three: model complexity
+  sample_size = tune(), 
+  mtry = tune(),         ## randomness
+  learn_rate = tune() ## step size
+) %>%
+  set_engine("xgboost") %>%
+  set_mode("regression")
+```
+
+
+## Summary of Tuning Considerations
+
+```{r}
+xgb_grid <- grid_space_filling(
+  tree_depth(),
+  min_n(),
+  loss_reduction(), 
+  sample_size = sample_prop(),
+  finalize(mtry(), ou_train),
+  learn_rate(),
+  size = 50  # 200?
+)
+```
+
+
+```{r}
+ou_wf <- workflow() %>%
+  add_recipe(ou_rec) %>%
+  add_model(xgb_spec)
+```
+
+# resampling inside (monte carlo) and outside (k-fold) the data
+
+```{r}
+ou_rs <- ou_train %>% vfold_cv()
+```
+
+## Fit Model
+
+```{r}
+fit_model<-TRUE
+
+if(fit_model){
+  doParallel::registerDoParallel()
+  
+xg_tune_res <- tune_grid(
+  ou_wf,
+  grid=xgb_grid,
+  resamples = ou_rs,
+)
+save(xg_tune_res,file="xg_tune_res.Rdata")
+
+} else{
+  load("xg_tune_res.Rdata")
+}
+```
+
+
+```{r}
+show_best(xg_tune_res,metric="rmse")
+```
+
+```{r}
+best_auc <- select_best(xg_tune_res,metric =  "rmse")
+```
+
+```{r}
+final_xgb <- finalize_workflow(
+  ou_wf,
+  best_auc
+)
+```
+
+
+
+```{r}
+final_xgb %>%
+  fit(data = ou_train) %>%
+  extract_fit_parsnip() %>%
+  vip(geom = "point")+
+  geom_point(color="blue")+
+  theme_minimal()
+```
+
+
+```{r}
+# Fit the model and extract variable importance
+importance_df <- final_xgb %>%
+  fit(data = ou_train) %>%
+  extract_fit_parsnip() %>%
+  vi()
+
+# View the result
+print(importance_df,n=20)
+```
+
+
+```{r}
+final_res <- last_fit(
+  final_xgb,           
+  ou_split         
+  #metrics = custom_metrics
+)
+
+collect_metrics(final_res)
+```
+
+
+# shap values
+
+```{r}
+library(SHAPforxgboost)
+
+# Extract the final trained model
+final_model <- final_xgb %>%
+  fit(data = ou_train) %>%
+  extract_fit_parsnip() %>%
+  extract_fit_engine()  # Use extract_fit_engine() instead of pull_workflow_fit()
+
+# Prepare the data for SHAP (remove ID and outcome variables)
+xgb_data <- ou_train %>%
+  select(-Anon.Student.Id, -PostMath) %>%
+  as.matrix()
+
+# Compute SHAP values
+shap_values <- shap.values(xgb_model = final_model, X_train = xgb_data)
+
+# Create SHAP summary plot
+shap_long <- shap.prep(shap_contrib = shap_values$shap_score, X_train = xgb_data)
+
+# Plot SHAP summary
+shap.plot.summary(shap_long)
+```
+
+
+
+
