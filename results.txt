@@ -1,0 +1,2 @@
+RandomForest: RMSE=0.16, R2=0.70, MAE=0.11
+XGBoost: RMSE=0.17, R2=0.66, MAE=0.12
