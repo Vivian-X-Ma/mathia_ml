@@ -1,7 +1,7 @@
 import pandas as pd
 
-df_summary = pd.read_csv('workspace_summary_train.csv')
-student_features = pd.read_csv('student_features.csv')
+df_summary = pd.read_csv('student_scores_train.csv')
+student_features = pd.read_csv('final_combined_features.csv')
 
 student_features = student_features.reset_index()
 
