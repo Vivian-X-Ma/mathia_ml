@@ -1,0 +1,189 @@
+
+```{r}
+library(skimr)
+library(tidyverse)
+library(tidymodels)
+library(janitor)
+library(dplyr)
+```
+
+
+```{r}
+#score <- read_csv('C:/Users/ASUS/Desktop/MATHia/student_scores_train.csv')
+train <- read_csv('C:/Users/ASUS/Desktop/MATHia/training_set_with_formatted_time.csv')
+#glimpse(score)
+```
+
+```{r}
+summary <- read_csv('C:/Users/ASUS/Desktop/MATHia/workspace_summary_train.csv')
+summary <- summary %>% distinct()
+```
+
+
+# JIT Feedback Per Problem
+
+### 看每个学生对应那些problem
+```{r eval=FALSE, include=FALSE}
+df_list <- train %>%
+  select(Anon.Student.Id, Problem.Name) %>%
+  distinct() %>%
+  arrange(Anon.Student.Id, Problem.Name)
+```
+
+```{r}
+#df_variant <- action %>%
+#   #select(Anon.Student.Id, Level..Workspace.Id., Outcome) %>%
+# colnames(train)
+
+df <- train %>%
+  group_by(Anon.Student.Id) %>%
+  summarise(
+    
+    # 1. # Number of problem completed 
+    num_problem = n_distinct(`Problem.Name`), 
+    
+    # 2. JIT Feedback Per Problem
+    avg_jit_per_problem = sum(grepl("JIT", Outcome)) / num_problem,
+    
+    # 3. Total Attempts Per Problem
+    avg_attempt_per_problem = ifelse(num_problem > 0, sum(Action == "Attempt") / num_problem, 0),
+    
+    # 4. Correct Attempts Per Problem
+    avg_correct_attempt_per_problem = ifelse(
+      num_problem > 0,
+      sum(Outcome %in% c("OK", "OK_AMBIGUOUS")) / num_problem,
+      0
+    ),
+    
+    # 5. Correct Attempt Ratio
+    correct_attempt_ratio = sum(Outcome %in% c("OK", "OK_AMBIGUOUS")) /sum(Action == "Attempt"),
+    
+    # 6. avg_hint_count
+    avg_hint_count = sum(Outcome %in% c("INITIAL_HINT", "HINT_LEVEL_CHANGE")) /num_problem,
+    
+    # 7. avg_error_count
+    avg_error_count = sum(Outcome == "ERROR") /num_problem
+  
+  ) %>%
+  ungroup()
+
+```
+
+# 8. Graduation rate
+
+```{r}
+graduation_rate <- train %>%
+  distinct(Anon.Student.Id, Problem.Name, .keep_all = TRUE) %>%  # 先按学生和题目去重
+  group_by(Anon.Student.Id) %>%
+  summarise(
+    num_problem = n(),  # 去重后的题目数量
+    graduation_rate = sum(CF..Workspace.Progress.Status. == "GRADUATED") / num_problem
+  ) %>%
+  dplyr::select(-num_problem)
+```
+
+
+```{r}
+df_merged <- df %>%
+  left_join(graduation_rate, by = "Anon.Student.Id")
+
+#write.csv(df_merged, "C:/Users/ASUS/Desktop/MATHia/features.csv", row.names = FALSE)
+```
+
+
+
+# ------------------summary ---------------------------
+
+```{r}
+df_summary <- summary %>% 
+  group_by(Anon.Student.Id) %>%
+  summarise(
+    #num_workspaces_completed = n_distinct(workspace),
+    
+    avg_time_per_workspace = mean(workspace_total_time_seconds),
+    
+    #graduation_rate = sum(workspace_progress_status == "GRADUATED") / sum(num_workspaces_completed),
+    
+    avg_step_problems_completed = mean(step_by_step_problems_completed),
+    
+    avg_problem_completion_ratio = mean(problems_completed / max_problem_count),
+    
+    #avg_hint_count = mean(hint_count),
+    
+    #avg_error_count = mean(error_count),
+    
+    avg_skill_mastery_ratio = mean(
+      if_else(skills_encountered > 0,
+              skills_mastered / skills_encountered,
+              0)
+    ),
+    aplse_score_ratio = mean(aplse_earned / aplse_possible)
+  )
+
+
+```
+
+
+```{r}
+df_merged <- df_merged %>%
+  left_join(df_summary, by = "Anon.Student.Id")
+```
+
+
+```{r}
+write.csv(df_merged, "C:/Users/ASUS/Desktop/MATHia/features.csv", row.names = FALSE)
+```
+
+
+
+
+# 9. avg_time_per_problem -----------hold----------
+
+```{r}
+library(lubridate)
+
+avg_time_per_problem <- train %>%
+  # 确保 datetime 是时间格式
+  mutate(datetime = ymd_hms(datetime)) %>%
+  
+  # 按学生和题目分组，保留完整数据
+  group_by(Anon.Student.Id, Problem.Name) %>%
+  
+  # 按时间排序
+  arrange(datetime, .by_group = TRUE) %>%
+  
+  # 计算每个题目的完成时间（结束时间 - 开始时间）
+  summarise(
+    time_spent = as.numeric(difftime(max(datetime), min(datetime), units = "secs")),
+    .groups = "drop"
+  ) %>%
+  
+  # 重新按学生分组，计算总用时和题目数
+  group_by(Anon.Student.Id) %>%
+  summarise(
+    total_time_spent = sum(time_spent, na.rm = TRUE),
+    num_problem = n_distinct(Problem.Name),
+    avg_time_per_problem = total_time_spent / num_problem,
+    .groups = "drop"
+  )
+
+```
+
+```{r}
+student_problem_time <- train %>%
+  # 确保时间格式正确
+  mutate(datetime = ymd_hms(datetime)) %>%
+  
+  # 每位学生每道题为一组
+  group_by(Anon.Student.Id, Problem.Name) %>%
+  
+  # 按时间排序后计算完成时间（最大时间 - 最小时间）
+  arrange(datetime, .by_group = TRUE) %>%
+  summarise(
+    time_spent_sec = as.numeric(difftime(max(datetime), min(datetime), units = "secs")),
+    .groups = "drop"
+  )
+```
+
+
+
