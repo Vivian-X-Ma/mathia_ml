@@ -209,7 +209,7 @@ plt.show()
 
 
 residuals = y_pred - y_test
-
+-> I tried doing something here, but I forgot, so we could delete this
 
 
 # In[ ]:
