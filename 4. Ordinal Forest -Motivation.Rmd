@@ -1,0 +1,187 @@
+Ordered outcome model, like MASS::polr(): This is definitely a good fit for our outcome, but this kind of model is linear and when we have a big dataset like this including complex interactions, a linear model often leaves a lot of possible model performance on the table.
+
+```{r}
+library(tidyverse)
+library(tidymodels)
+library(dplyr)
+library(themis)
+library(caret)
+library(ordinalForest)
+```
+
+#===========================================
+# Read and inspect data
+#===========================================
+
+```{r}
+score <- read_csv('C:/Users/ASUS/Desktop/MATHia/student_scores_train.csv')
+feature <- read_csv('C:/Users/ASUS/Desktop/MATHia/features.csv')
+#glimpse(score)
+```
+
+```{r}
+ou <- score %>%
+  dplyr::select("Anon.Student.Id","PostMotivation3") %>%
+  left_join(feature, by = "Anon.Student.Id") %>%
+  dplyr::select(-Anon.Student.Id)
+```
+
+#===========================#
+#     Data Preprocessing    #
+#===========================#
+
+# round and remove NA
+```{r}
+table(ou$PostMotivation3)
+ou$PostMotivation3 <- round(ou$PostMotivation3)
+ou <- ou %>% drop_na()
+table(ou$PostMotivation3)
+```
+
+# outcome must be an ordered factor
+```{r}
+ou$PostMotivation3 <- factor(ou$PostMotivation3,
+                             levels = sort(unique(ou$PostMotivation3)),
+                             ordered = TRUE)
+
+ou$PostMotivation3
+table(ou$PostMotivation3)
+```
+
+
+#===========================#
+#   Feature Selection       #
+#===========================#
+
+```{r}
+selected_features <- c(
+  "num_problem",
+  "Level1_Hints_Per_Problem",
+  "Level2_Hints_Per_Problem",
+  "aplse_score_ratio",
+  "avg_hint_count",
+  "Level3_Hints_Per_Problem",
+  "correct_attempt_ratio",
+  "graduation_rate",
+  "avg_correct_attempt_per_problem"
+)
+```
+
+```{r}
+ou <- ou %>%
+  dplyr::select(PostMotivation3, all_of(selected_features))
+```
+
+
+#===========================#
+#   Training and testing    #
+#===========================#
+
+```{r}
+set.seed(123)
+
+ou_split<-initial_split(ou, strata = "PostMotivation3")
+
+ou_train<-training(ou_split)
+
+ou_test<-testing(ou_split)
+```
+
+
+## Formula and Recipe
+```{r}
+rf_formula<-as.formula("PostMotivation3 ~ .")
+
+ou_rec <- recipe(rf_formula, data = ou_train) %>%
+  update_role(PostMotivation3, new_role = "outcome") %>%
+  step_nzv(all_predictors()) %>%
+  step_impute_knn(all_numeric_predictors()) %>%
+  step_corr(all_numeric_predictors(), threshold = 0.95) %>%
+  step_normalize(all_predictors()) %>%
+  step_smote(PostMotivation3, over_ratio = 1, neighbors = 3)  # oversampling
+```
+
+# Bake the data 
+```{r}
+ou_prep <- prep(ou_rec, training = ou_train)
+ou_baked <- bake(ou_prep, new_data = NULL)
+
+```
+
+
+#===========================#
+#   Training and Testing    #
+#===========================#
+
+```{r}
+ou_baked$PostMotivation3 <- as.ordered(ou_baked$PostMotivation3)
+
+# Get X and Y
+features <- ou_baked %>% dplyr::select(-PostMotivation3)
+response <- ou_baked$PostMotivation3
+
+# Combine
+ord_data <- cbind(PostMotivation3 = response, features)
+```
+
+```{r}
+# Train the model
+ord_model <- ordfor(
+  depvar = "PostMotivation3",
+  data = ord_data,
+  perffunction = "proportional"
+)
+```
+
+
+# Variable Importance
+```{r eval=FALSE, include=FALSE}
+var_imp <- ord_model$varimp
+
+print(var_imp)
+
+var_imp_sorted <- sort(var_imp, decreasing = TRUE)
+print(head(var_imp_sorted, 10))
+
+```
+
+
+#===========================#
+#  Prediction + Evaluation  #
+#===========================#
+
+```{r}
+# Bake the test data!!
+ou_test  <- bake(ou_prep, new_data = ou_test)
+
+# prepare the test data
+test_data <- ou_test %>%
+  dplyr::select(-PostMotivation3) 
+
+# Predict
+preds <- predict(ord_model, newdata = test_data)
+```
+
+```{r}
+y_true <- as.ordered(ou_test$PostMotivation3)
+y_pred <- as.ordered(preds$ypred)
+
+# Accuracy
+accuracy <- mean(y_true == y_pred)
+print(paste("Accuracy:", round(accuracy, 4)))
+```
+
+
+#===========================#
+#        QWK results        #
+#===========================#
+
+```{r}
+library(Metrics)
+
+qwk_score <- ScoreQuadraticWeightedKappa(as.integer(y_true), as.integer(y_pred))
+print(qwk_score)
+```
+
+> print(qwk_score)
+[1] 0.1734302

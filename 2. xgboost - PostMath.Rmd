@@ -1,0 +1,274 @@
+---
+title: "XGBOOST for PostMath3"
+author: "Siqi"
+date: "2025-06-22"
+output: html_document
+---
+
+# Load required packages
+# (Make sure these packages are installed before running)
+
+```{r}
+library(tidyverse)      # data manipulation + plotting
+library(tidymodels)     # modeling framework
+library(xgboost)        # modeling backend
+library(vip)            # variable importance
+library(caret)          # for RFE
+library(yardstick)      # evaluation metrics
+
+```
+
+#===========================================
+# Read and inspect data
+#===========================================
+
+```{r}
+# read the scores
+score <- read_csv('C:/Users/ASUS/Desktop/MATHia/student_scores_train.csv')
+
+# read the features that we calculated 
+feature <- read_csv('C:/Users/ASUS/Desktop/MATHia/features.csv')
+```
+
+# Merge features with labels based on Anon.Student.Id
+```{r}
+ou <- feature %>%
+  left_join(score %>% dplyr::select(Anon.Student.Id, PostMath), by = "Anon.Student.Id") %>%
+  dplyr::select(-Anon.Student.Id)
+```
+
+# Filter out rows where PostMath is missing 
+```{r}
+ou <- ou %>% filter(!is.na(PostMath))
+```
+
+
+
+#===========================================
+# Feature Selection
+#===========================================
+
+```{r}
+selected_features <- c(  
+  "num_problem", #1
+  "avg_hint_count", #3 
+  "correct_attempt_ratio", #4
+  "avg_error_count", #5
+  "aplse_score_ratio" #6
+)
+
+```
+
+```{r}
+ou <- ou %>%
+  dplyr::select(PostMath, all_of(selected_features))
+```
+
+
+```{r}
+set.seed(123)
+
+ou_split<-initial_split(ou)
+
+ou_train<-training(ou_split)
+
+ou_test<-testing(ou_split)
+```
+
+
+## Formula and Recipe
+```{r}
+# Define formula
+rf_formula<-as.formula("PostMath ~ .")
+
+# Create a recipe:
+# - Set ID and outcome roles
+# - Remove near-zero variance features
+# - Impute missing numeric values using KNN
+# - Remove highly correlated predictors
+# - Normalize all predictors
+
+ou_rec <- recipe(rf_formula, data = ou_train) %>%
+  #update_role(Anon.Student.Id, new_role = "ID") %>%
+  update_role(PostMath, new_role = "outcome") %>%
+  step_nzv(all_predictors()) %>%
+  step_impute_knn(all_numeric_predictors()) %>%
+  #step_log(avg_time_per_workspace) %>%
+  step_corr(all_numeric_predictors(), threshold = 0.95) %>%
+  step_normalize(all_predictors())
+
+```
+
+
+
+#===========================================
+# XGBoost Model Specification & Hyperparameter Grid
+#===========================================
+
+## XGboost Specification
+```{r}
+xgb_spec <- boost_tree(
+  trees = 1000,
+  tree_depth = tune(), 
+  min_n = tune(),
+  loss_reduction = tune(), ## first three: model complexity
+  sample_size = tune(), 
+  mtry = tune(),         ## randomness
+  learn_rate = tune() ## step size
+) %>%
+  set_engine("xgboost") %>%
+  set_mode("regression")
+```
+
+
+## Summary of Tuning Considerations
+```{r}
+xgb_grid <- grid_space_filling(
+  tree_depth(),
+  min_n(),
+  loss_reduction(), 
+  sample_size = sample_prop(),
+  finalize(mtry(), ou_train),
+  learn_rate(),
+  size = 200
+)
+```
+
+
+```{r}
+ou_wf <- workflow() %>%
+  add_recipe(ou_rec) %>%
+  add_model(xgb_spec)
+```
+
+# resampling inside (monte carlo) and outside (k-fold) the data
+
+```{r}
+set.seed(234)
+ou_rs <- ou_train %>% vfold_cv()
+```
+
+## Fit Model
+
+```{r}
+doParallel::registerDoParallel()
+  
+set.seed(2025)
+  
+xg_tune_res <- tune_grid(
+  ou_wf,
+  grid=xgb_grid,
+  resamples = ou_rs,
+)
+```
+
+# Select Best Model and Finalize Workflow
+```{r}
+show_best(xg_tune_res,metric="rmse")
+```
+
+```{r}
+best_auc <- select_best(xg_tune_res,metric =  "rmse")
+```
+
+```{r}
+final_xgb <- finalize_workflow(
+  ou_wf,
+  best_auc
+)
+```
+
+# Feature Importance
+```{r}
+# Fit the model and extract variable importance
+importance_df <- final_xgb %>%
+  fit(data = ou_train) %>%
+  extract_fit_parsnip() %>%
+  vi()
+
+# View the result
+print(importance_df,n = 20)
+```
+
+> 
+# A tibble: 16 × 2
+   Variable                        Importance
+   <chr>                                <dbl>
+ 1 num_problem                        0.330  
+ 2 avg_problem_completion_ratio       0.307  
+ 3 avg_hint_count                     0.0835 
+ 4 correct_attempt_ratio              0.0686 
+ 5 avg_error_count                    0.0460 
+ 6 aplse_score_ratio                  0.0377 
+ 7 avg_jit_per_problem                0.0323 
+ 8 avg_attempt_per_problem            0.0287 
+ 9 avg_correct_attempt_per_problem    0.0185 
+10 avg_step_problems_completed        0.0145 
+11 avg_time_per_workspace             0.0139 
+12 hint1                              0.00713
+13 hint2                              0.00504
+14 hint3                              0.00405
+15 avg_skill_mastery_ratio            0.00215
+16 graduation_rate                    0.00118
+
+
+
+#===========================#
+#   Prediction + Evaluation #
+#===========================#
+
+```{r}
+library(yardstick)
+
+custom_metrics <- metric_set(yardstick::rmse, yardstick::mae, yardstick::rsq)
+
+final_res <- last_fit(
+  final_xgb,           
+  ou_split,       
+  metrics = custom_metrics
+)
+
+collect_metrics(final_res)
+```
+
+
+> collect_metrics(final_res)
+# A tibble: 3 × 4
+  .metric .estimator .estimate .config             
+  <chr>   <chr>          <dbl> <chr>               
+1 rmse    standard      0.124  Preprocessor1_Model1
+2 mae     standard      0.0896 Preprocessor1_Model1
+3 rsq     standard      0.787  Preprocessor1_Model1
+
+
+
+
+#===========================#
+#     SHAP values           #
+#===========================#
+```{r eval=FALSE, include=FALSE}
+library(SHAPforxgboost)
+
+# Extract the final trained model
+final_model <- final_xgb %>%
+  fit(data = ou_train) %>%
+  extract_fit_parsnip() %>%
+  extract_fit_engine()  # Use extract_fit_engine() instead of pull_workflow_fit()
+
+# Prepare the data for SHAP (remove ID and outcome variables)
+xgb_data <- ou_train %>%
+  select(#-Anon.Student.Id,
+         -PostMath) %>%
+  as.matrix()
+
+# Compute SHAP values
+shap_values <- shap.values(xgb_model = final_model, X_train = xgb_data)
+
+# Create SHAP summary plots
+shap_long <- shap.prep(shap_contrib = shap_values$shap_score, X_train = xgb_data)
+
+# Plot SHAP summary
+shap.plot.summary(shap_long)
+```
+
+
