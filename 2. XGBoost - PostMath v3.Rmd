@@ -1,0 +1,248 @@
+---
+title: "XGBOOST for PostMath3"
+author: "Siqi"
+date: "2025-06-22"
+output: html_document
+---
+
+# Load required packages
+# (Make sure these packages are installed before running)
+```{r}
+library(tidyverse)      # data manipulation + plotting
+library(tidymodels)     # modeling framework
+library(xgboost)        # modeling backend
+library(vip)            # variable importance
+library(yardstick)      # evaluation metrics
+```
+
+#=======================#
+# Read and inspect data #
+#=======================#
+
+```{r}
+# read the scores
+score <- read_csv('C:/Users/ASUS/Desktop/MATHia/student_scores_train.csv')
+
+# read the features that we calculated 
+feature <- read_csv('C:/Users/ASUS/Desktop/MATHia/features_train.csv')
+```
+
+# Merge features with labels based on Anon.Student.Id
+```{r}
+ou <- feature %>%
+  left_join(score %>% dplyr::select(Anon.Student.Id, PostMath), by = "Anon.Student.Id") 
+  #%>% dplyr::select(-Anon.Student.Id)
+
+```
+
+# Filter out rows where PostMath is missing 
+```{r}
+ou <- ou %>% filter(!is.na(PostMath))
+```
+
+
+
+#===========================================
+# Feature Selection
+#===========================================
+
+```{r}
+selected_features <- c(  
+  "num_problem", 
+  "avg_hint_count", 
+  "correct_attempt_ratio",
+  "avg_error_count",
+  "aplse_score_ratio"
+)
+
+```
+
+```{r}
+ou <- ou %>%
+  dplyr::select(Anon.Student.Id, PostMath, all_of(selected_features))
+```
+
+
+#===========================#
+#     Train-Test Split      #
+#===========================#
+
+```{r}
+ou_train <- ou
+```
+
+
+## Formula and Recipe
+```{r}
+# Define formula
+rf_formula<-as.formula("PostMath ~ .")
+
+# Create a recipe:
+# - Set ID and outcome roles
+# - Remove near-zero variance features
+# - Impute missing numeric values using KNN
+# - Remove highly correlated predictors
+# - Normalize all predictors
+
+ou_rec <- recipe(rf_formula, data = ou_train) %>%
+  update_role(Anon.Student.Id, new_role = "ID") %>%
+  update_role(PostMath, new_role = "outcome") %>%
+  step_nzv(all_predictors()) %>%
+  step_impute_knn(all_numeric_predictors()) %>%
+  #step_log(avg_time_per_workspace) %>%
+  step_corr(all_numeric_predictors(), threshold = 0.95) %>%
+  step_normalize(all_predictors())
+```
+
+
+
+#===========================================
+# XGBoost Model Specification & Hyperparameter Grid
+#===========================================
+
+## XGboost Specification
+```{r}
+xgb_spec <- boost_tree(
+  trees = 1000,
+  tree_depth = tune(), 
+  min_n = tune(),
+  loss_reduction = tune(), ## first three: model complexity
+  sample_size = tune(), 
+  mtry = tune(),         ## randomness
+  learn_rate = tune() ## step size
+) %>%
+  set_engine("xgboost") %>%
+  set_mode("regression")
+```
+
+
+## Summary of Tuning Considerations
+```{r}
+xgb_grid <- grid_space_filling(
+  tree_depth(),
+  min_n(),
+  loss_reduction(), 
+  sample_size = sample_prop(),
+  finalize(mtry(), ou_train),
+  learn_rate(),
+  size = 200
+)
+```
+
+
+```{r}
+ou_wf <- workflow() %>%
+  add_recipe(ou_rec) %>%
+  add_model(xgb_spec)
+```
+
+# resampling inside (monte carlo) and outside (k-fold) the data
+
+```{r}
+set.seed(234)
+ou_rs <- ou_train %>% vfold_cv()
+```
+
+## Fit Model
+
+```{r}
+doParallel::registerDoParallel()
+  
+set.seed(2025)
+  
+xg_tune_res <- tune_grid(
+  ou_wf,
+  grid=xgb_grid,
+  resamples = ou_rs,
+)
+```
+
+# Select Best Model and Finalize Workflow
+```{r}
+show_best(xg_tune_res,metric="rmse")
+```
+
+```{r}
+best_auc <- select_best(xg_tune_res,metric =  "rmse")
+```
+
+```{r}
+final_xgb <- finalize_workflow(
+  ou_wf,
+  best_auc
+)
+```
+
+
+# save the workflow
+```{r}
+# Fit the finalized workflow on full training data
+final_fit <- final_xgb %>% fit(data = ou_train)
+
+# Save the fitted workflow object and recipe
+saveRDS(final_fit, file = "C:/Users/ASUS/Desktop/MATHia/PostMath/final_xgb_workflow.rds")
+
+```
+
+
+
+
+
+#------------------TESTING START HERE--------------------
+---------------------------------------------------------
+
+# adjust Path
+```{r}
+# Load model and preprocessing steps
+loaded_workflow <- readRDS("C:/Users/ASUS/Desktop/MATHia/PostMath/final_xgb_workflow.rds")
+```
+
+# adjust path
+```{r}
+feature_test <- read_csv("C:/Users/ASUS/Desktop/MATHia/features_test.csv")  # adjust path
+```
+
+
+# prepare the test data
+```{r}
+selected_features <- c(  
+  "num_problem", 
+  "avg_hint_count", 
+  "correct_attempt_ratio",
+  "avg_error_count",
+  "aplse_score_ratio"
+)
+```
+
+```{r}
+ou_test <- feature_test %>% 
+  dplyr::select(Anon.Student.Id, all_of(selected_features))
+```
+
+
+# Use the workflow and predict 
+```{r}
+# Predict on new data (make sure new data has same feature columns)
+predictions <- predict(loaded_workflow, new_data = ou_test) %>% pull(.pred)
+```
+
+
+# Select the student ID column and bind the predictions
+# Then rename the prediction column from '...2' to 'pred' for clarity
+```{r}
+prediction_results <- ou_test %>%
+  dplyr::select(Anon.Student.Id) %>%
+  bind_cols(predictions) %>%
+  rename(.pred = `...2`)
+```
+
+
+
+#===========================#
+#      Output Files         #
+#===========================#
+
+```{r}
+write.csv(prediction_results, "C:/Users/ASUS/Desktop/MATHia/PostMath/PostMath_pred.csv", row.names = FALSE)
+```
+

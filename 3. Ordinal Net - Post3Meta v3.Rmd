@@ -1,0 +1,242 @@
+
+```{r}
+library(tidyverse)
+library(tidymodels)
+library(dplyr)
+library(themis)
+```
+
+#------------------------------------------------------------
+# Training process-------------------------------------------
+
+# adjust paths
+```{r}
+score <- read_csv('C:/Users/ASUS/Desktop/MATHia/student_scores_train.csv')
+feature <- read_csv('C:/Users/ASUS/Desktop/MATHia/features_train.csv')
+```
+
+# merge the data
+```{r}
+ou <- score %>%
+  dplyr::select("Anon.Student.Id","Post3Meta") %>%
+  left_join(feature, by = "Anon.Student.Id")
+```
+
+# Round the Post3Meta
+```{r}
+table(ou$Post3Meta)
+
+ou$Post3Meta <- round(ou$Post3Meta)
+
+ou <- ou %>% drop_na(Post3Meta)
+
+table(ou$Post3Meta)
+```
+
+
+# Convert Scores into Ordinal Categories
+```{r}
+ou$Post3Meta <- factor(ou$Post3Meta,
+                             levels = sort(unique(ou$Post3Meta)),
+                             ordered = TRUE)
+
+# check the data 
+ou$Post3Meta
+table(ou$Post3Meta)
+```
+
+
+#===========================#
+#     feature selection     #
+#===========================#
+
+```{r}
+selected_features <- c("avg_step_problems_completed",
+                   "Level1_Hints_Per_Problem",
+                   "Level2_Hints_Per_Problem",
+                   "Level3_Hints_Per_Problem",
+                   "aplse_score_ratio",
+                   "correct_attempt_ratio",
+                   "avg_attempt_per_problem",
+                   "avg_correct_attempt_per_problem",
+                   "graduation_rate",
+                   "avg_hint_count"
+                   )
+```
+
+
+```{r}
+ou <- ou %>% 
+  dplyr::select(Anon.Student.Id, Post3Meta, all_of(selected_features))
+```
+
+
+#===========================#
+#     Train-Test Split      #
+#===========================#
+
+# using all the data as the training set
+```{r}
+ou_train<- ou
+```
+
+## Formula and Recipe
+```{r}
+rf_formula<-as.formula("Post3Meta ~ .")
+```
+
+```{r}
+ou_rec <- recipe(rf_formula, data = ou_train) %>%
+  update_role(Anon.Student.Id, new_role = "ID") %>%
+  update_role(Post3Meta, new_role = "outcome") %>%
+  step_nzv(all_predictors()) %>%
+  step_impute_knn(all_numeric_predictors()) %>%
+  step_corr(all_numeric_predictors(), threshold = 0.95) %>%
+  step_normalize(all_predictors()) %>%
+  step_smote(Post3Meta, over_ratio = 1, neighbors = 3)
+
+```
+
+
+```{r}
+ou_prep <- prep(ou_rec, training = ou_train)
+ou_baked <- bake(ou_prep, new_data = NULL)
+
+table(ou_baked$Post3Meta)
+```
+
+
+#===========================#
+#     OrdinalNet Model      #
+#===========================#
+
+```{r}
+library("ordinalNet")
+library("ordinalgmifs")
+```
+
+```{r}
+# make sure its ordered factor
+y <- ou_baked$Post3Meta
+# Prepare predictor matrix (exclude outcome and ID columns)
+x <- ou_baked %>%
+  dplyr::select(-Post3Meta, -Anon.Student.Id) %>%
+  as.matrix()
+
+
+# tune the model
+set.seed(123)
+fit_tuned <- ordinalNetTune(
+  x = x,
+  y = y,
+  family = "cumulative",   # ordered logit
+  link = "logit",
+  parallelTerms = TRUE,
+  nonparallelTerms = FALSE,
+  lambdaMinRatio = 1e-4,   
+  nFolds = 10, 
+  printProgress = TRUE   
+)
+
+summary(fit_tuned)
+
+```
+
+#===========================#
+#         Save model        #
+#===========================#
+
+```{r}
+saveRDS(fit_tuned, file = "C:/Users/ASUS/Desktop/MATHia/Post3Meta/ordinalnet_fit_tuned_post3Meta.rds")
+
+saveRDS(ou_rec, file = "C:/Users/ASUS/Desktop/MATHia/Post3Meta/ordinalnet_recipe_post3Meta.rds")
+```
+
+
+
+
+
+#------------------TESTING START HERE---------------------
+#---------------------------------------------------------
+
+# adjust path
+```{r}
+# Load model and preprocessing steps
+fit_tuned <- readRDS("C:/Users/ASUS/Desktop/MATHia/Post3Meta/ordinalnet_fit_tuned_post3Meta.rds")
+prep_rec <- readRDS("C:/Users/ASUS/Desktop/MATHia/Post3Meta/ordinalnet_recipe_post3Meta.rds")
+```
+
+# read the testing data, adjust path
+```{r}
+feature_test <- read_csv("C:/Users/ASUS/Desktop/MATHia/features_test.csv")  # adjust path
+```
+
+
+#===========================#
+#     feature selection     #
+#===========================#
+
+```{r}
+selected_features <- c("avg_step_problems_completed",
+                   "Level1_Hints_Per_Problem",
+                   "Level2_Hints_Per_Problem",
+                   "aplse_score_ratio",
+                   "correct_attempt_ratio",
+                   "avg_attempt_per_problem",
+                   "avg_correct_attempt_per_problem",
+                   "graduation_rate",
+                   "Level3_Hints_Per_Problem",
+                   "avg_hint_count"
+                   )
+```
+
+
+```{r}
+ou_test <- feature_test %>%
+  dplyr::select(Anon.Student.Id, all_of(selected_features))
+```
+
+
+#===========================#
+#     Predict Test Labels   #
+#===========================#
+
+```{r}
+library("ordinalNet")
+library("ordinalgmifs")
+```
+
+```{r}
+# bake the test data
+prep_rec <- prep(prep_rec)
+ou_test  <- bake(prep_rec, new_data = ou_test)
+
+# Convert to matrix
+x_test <- ou_test %>% 
+  dplyr::select(- Anon.Student.Id) %>%  
+  model.matrix(~ . -1, data = .)
+
+# Predict class
+pred_class <- predict(fit_tuned$fit, newx = x_test, type = "class",
+                      whichLambda = fit_tuned$lambdaOpt)
+
+# Combine predictions with the original ID
+df_pred <- tibble(
+  Anon.Student.Id = ou_test$Anon.Student.Id,   # keep the original ID
+  .pred = factor(pred_class, levels = 1:7, ordered = TRUE)  # predicted classes
+)
+
+```
+
+
+#===========================#
+#      Output Files         #
+#===========================#
+
+```{r}
+write.csv(df_pred, "C:/Users/ASUS/Desktop/MATHia/Post3Meta/Post3Meta_pred.csv", row.names = FALSE)
+```
+
+
+
+
